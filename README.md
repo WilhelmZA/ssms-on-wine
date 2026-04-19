@@ -167,11 +167,13 @@ SQL-SSMS/
     └── ssms-patcher.csproj
 ```
 
-## Contact / issues
+## Issues
 
-Built and debugged by Wilhelm (insight.co.za). If you hit a bug the
-troubleshooting section doesn't cover, the full debugging log of how
-this was built is in `project_ssms_wine.md` (internal memory).
+Open an issue at
+<https://github.com/WilhelmZA/ssms-on-wine/issues> if you hit something
+the troubleshooting section doesn't cover. Include your wine version
+(`wine --version`), Ubuntu version (`lsb_release -ds`), and the SSMS
+Output Window → Object Explorer pane contents if it's an OE problem.
 
 ## License
 
