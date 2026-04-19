@@ -1,0 +1,12 @@
+# Built binaries (published to GitHub Releases, or rebuild with `make`)
+/bin/ssms-patcher
+/bin/*.pdb
+
+# .NET build artefacts
+/src/bin/
+/src/obj/
+
+# Wine / runtime artefacts
+*.orig-gif
+*.preinject
+.DS_Store

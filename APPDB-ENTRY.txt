@@ -1,0 +1,337 @@
+=======================================================
+WINE VERSION
+=======================================================
+
+wine-11.0 (stable) from the official WineHQ repo (winehq-stable).
+Also tested briefly with wine-11.7 (Staging) — same behavior for the
+issues documented below.
+
+Host: Ubuntu 24.04.4 LTS ("Noble"), x86_64, Wayland session.
+WINEPREFIX architecture: win64 (wow64 layout; Ssms.exe itself is 32-bit).
+
+
+=======================================================
+INSTALLATION
+=======================================================
+
+Created a dedicated prefix at ~/.wine-ssms (WINEARCH=win64) and
+applied the following winetricks verbs in order:
+
+    win10
+    remove_mono internal         (Wine Mono uninstalled)
+    dotnet40
+    dotnet48                     (target framework for SSMS)
+    vcrun2022
+    gdiplus                      (native MS GDI+ — see "What does
+                                  not work" below; GIF still broken)
+    d3dcompiler_43
+    d3dcompiler_47
+    d3dx9
+    dxvk
+    msxml6
+    windowscodecs                (native; does not fix GIF either)
+    corefonts (plus: andale, arial, comicsans, courier, georgia,
+               impact, times, trebuchet, verdana, webdings)
+
+Then ran the Microsoft SSMS 20.2.1 bundled installer
+(SSMS-Setup-ENU.exe). The installer successfully lays down:
+    - VS 2017 Isolated Shell
+    - Microsoft OLE DB Driver for SQL Server
+    - Microsoft ODBC Driver 17 for SQL Server
+    - Microsoft Analysis Services OLE DB Provider
+    - VSTA 2019 (both x86 and x64 hosting support)
+    - VC++ 2022 redistributables
+
+Kerberos is handled Linux-side: the user runs `kinit` on the host,
+and Wine's SSPI stack picks up the ticket cache automatically.
+No MIT Kerberos port needed inside the prefix.
+
+
+=======================================================
+WHAT WORKS (after workarounds described below)
+=======================================================
+
+- Installer (SSMS-Setup-ENU.exe) runs to completion.
+- Ssms.exe launches and the VS Shell main window renders correctly.
+- Connect Dialog with Windows Authentication via Kerberos against
+  a remote SQL Server (tested against SQL Server 2022 16.0.1165)
+  using the user's kinit-cached ticket. SSPI negotiation succeeds.
+- Query Editor (New Query): T-SQL editing, IntelliSense basics,
+  F5 execute, result grid, multi-row result sets, messages pane.
+- Object Explorer — full tree enumeration:
+    * Server node with version shown
+    * Databases folder → user databases, System Databases,
+      Database Snapshots
+    * Inside each database: Tables (System/External/Graph), Views,
+      Synonyms, Programmability, Service Broker, Storage, Security
+    * Individual objects (dbo.*) with right-click actions
+    * Expanding user DBs issues real SMO queries and returns rows
+- Server-level context menus, right-click Refresh, keyboard
+  expand/collapse.
+- Server Properties dialog.
+- Database Mail node opens without crash (now that GIF resources
+  are replaced with PNG — see workarounds).
+- Output Window → "Object Explorer" pane shows SMO trace output
+  when SSMS.OutputWindow.ObjectExplorer is set.
+- Multiple query tabs and multiple database context switches.
+- Copying query results to clipboard.
+
+
+=======================================================
+WHAT DOES NOT WORK (without workarounds)
+=======================================================
+
+Without the workarounds below, out-of-the-box Wine 11.0 + a fresh
+install of SSMS 20.2.1 fails in this cascade:
+
+1. Opening a New Query throws:
+        "The type initializer for 'Microsoft.SqlServer.Management.
+         UI.VSIntegration.Editors.QEStatusBarManager' threw an
+         exception."
+   Root cause: QEStatusBarManager's static ctor calls
+   new Bitmap(typeof(QEStatusBarManager), "spin1.gif") for its
+   status-bar spinner frames. Wine 11.0's windowscodecs GIF decoder
+   throws ArgumentException("Parameter is not valid.") for every
+   GIF we tested. PNG, JPEG, BMP, and ICO all decode fine.
+
+2. Object Explorer "Databases" node stays empty (no user DBs, no
+   system DBs; only the two static "System Databases" and "Database
+   Snapshots" folder placeholders appear).
+   Root cause: when OE's NavigableItemBuilder.Build runs, it calls
+   NavigationService.Initialize which calls
+       ServiceProvider.GetService<IRegistrationService>(this, true)
+   on itself. NavigationService : Component, IServiceProvider.
+   Under Wine this GetService walk never reaches VS Shell's global
+   service container where IRegistrationService has been registered
+   by the SqlStudio package. On Windows the same code finds it.
+   The exception (ServiceNotFoundException) is caught inside
+   Build's try/catch and silently swallowed — it only logs if
+   SSMS.OutputWindow.ObjectExplorer=true in UserSettings.xml. This
+   was the single hardest bug to find because it's hidden behind a
+   silent catch and because OE builds a static-folder tree scaffold
+   even when SMO enumeration fails.
+
+3. Server Properties, Database Mail node, Registered Servers, and a
+   handful of other dialogs throw
+        "Parameter is not valid. (System.Drawing)"
+   Same underlying cause as (1): they load GIF icons for their
+   toolbar/tree images at dialog initialization.
+
+4. Several background threads call odbc32.SQLBrowseConnectA and
+   hit Wine's stub:
+        wine: Call from 7B5FC417 to unimplemented function
+              odbc32.dll.SQLBrowseConnectA, aborting
+   Wine implements the W variant of this API but not the A.
+   In our case this kills only a background instance-discovery
+   thread and is non-fatal to the UI, but it is a genuine Wine bug
+   that would block any ANSI-era ODBC app.
+
+5. AppDomainManagerAssembly / AppDomainManagerType entries in the
+   <runtime> section of Ssms.exe.config are silently ignored.
+   Strong-named or not, there is no fusion log entry, no type load
+   attempt, and InitializeNewDomain is never called. This is the
+   documented supported way to hook FirstChanceException at process
+   start — Wine 11 ignores it.
+
+6. <Module>.cctor (module initializer) added to a managed DLL via
+   Cecil is not invoked. A cctor added to a regular class IS
+   invoked — only module-level initializers are skipped.
+
+7. Installing native Microsoft windowscodecs.dll from a Windows 11
+   24H2 machine (build 10.0.26100.7920, both x86 SysWOW64 and x64
+   System32 versions) into the prefix and setting the DLL override
+   to "native" does NOT fix the GIF decoding. Something in Wine's
+   layering (likely gdiplus → Wine's own windowscodecs) bypasses
+   the native DLL.
+
+
+=======================================================
+WORKAROUNDS
+=======================================================
+
+We implemented the following binary patches against the installed
+SSMS DLLs. All patched files have .orig-gif / .preinject backups
+next to them in the IDE directory so the install is reversible.
+
+A. GIF → PNG resource swap across all IDE DLLs
+   Wrote a Mono.Cecil + SixLabors.ImageSharp tool that:
+     - scans every DLL under IDE/ for embedded GIF89a/GIF87a blobs
+       (both top-level EmbeddedResource entries and GIF blobs inside
+       .resources streams with BinaryFormatter-serialized Bitmaps)
+     - decodes each with ImageSharp
+     - re-encodes as PNG (with palette-8/palette-4 fallbacks to
+       meet byte-size constraints for in-stream replacements)
+     - pads PNGs with a prVt ancillary chunk to match the original
+       GIF byte length exactly, so outer .resources offsets stay
+       valid when we can't resize
+     - writes back with Cecil for top-level EmbeddedResource
+       (AssemblyDefinition.Write handles offset fixups)
+   GDI+ detects image format by magic bytes, not extension or
+   resource name, so "spin1.gif" with PNG payload decodes fine.
+   Result: 35 DLLs modified, ~120 GIFs replaced. The remaining
+   ~120 GIFs are inside .resources streams where PNG > GIF size
+   and we couldn't fit them even with palette-4 + minimum
+   compression; those belong to dialogs we don't care about
+   (Report Viewer / Mashup client / etc.) and their failure is
+   confined to specific dialogs.
+
+B. No-op NavigationService.Initialize + null GetView/GetEntity
+   Mono.Cecil rewrites three methods in
+       IDE/Microsoft.SqlServer.Management.SqlStudio.Explorer.dll :
+     - NavigationService.Initialize()  -> just "ret"
+     - NavigationService.GetView(str)  -> "ldnull; ret"
+     - NavigationService.GetEntity(str)-> "ldnull; ret"
+   The only caller that matters,
+   NavigableItemBuilder.GetColumnsFromNavigationService, already
+   handles null views: "if (view == null) yield break;". So OE
+   falls through to SMO's default column sets and enumerates fully.
+   Trade-off: the per-view column metadata from .ssmc config files
+   is lost (ordering, visibility, custom labels). In practice this
+   is invisible to the user; the default column sets are what most
+   people see anyway.
+
+C. DLL binding redirects
+   We hit 8 assembly-version mismatches during startup (System.
+   Text.Json, Microsoft.Bcl.AsyncInterfaces, System.Text.Encodings.
+   Web, StreamJsonRpc, System.Threading.Tasks.Dataflow, and 3
+   System.Security.* at v5.0.0.0). Standard mitigation:
+     - read fusion log for the ERR: 0x80131040 entries
+     - where disk version > requested, add a bindingRedirect
+     - where disk version < requested, download the correct NuGet
+       (lib/net462/ target) and install to IDE/
+   Edits must be applied to BOTH:
+     - IDE/Ssms.exe.config (source of truth)
+     - AppData/Local/Microsoft/SQL Server Management Studio/
+       20.0_IsoShell/Ssms.exe.config  (VS Shell regenerates this
+       from the IDE one on first successful startup; the CLR reads
+       the AppData copy at runtime).
+
+D. User setting to expose OE errors during debugging
+   Setting SSMS.OutputWindow.ObjectExplorer=true in
+   %APPDATA%/Microsoft/SQL Server Management Studio/20.0/
+   UserSettings.xml makes SSMS's built-in catch block log OE
+   exceptions to the View → Output → Object Explorer pane. This
+   was crucial for finding workaround B; leave it on.
+
+
+=======================================================
+WHAT WAS NOT TESTED
+=======================================================
+
+- SQL authentication mode (username/password). We only tested
+  Windows Authentication via Kerberos.
+- Local (named pipe / shared memory) connections — we only
+  tested TCP/IP to a remote server on a corporate LAN.
+- Encryption options beyond TrustServerCertificate=true
+  (no certificate store integration tested).
+- Azure connection types: SQL Database, SQL Managed Instance,
+  Synapse, Fabric. Not tested.
+- Azure AD Interactive / MFA authentication.
+- Integration Services / SSIS Project templates — SSMS shows the
+  menu items but we didn't exercise them. Given that several of
+  the SSIS-adjacent DLLs produce GIF-load errors during package
+  install, I'd expect issues.
+- Analysis Services (SSAS) connections and MDX/DAX query windows.
+- Reporting Services (SSRS) Report Server connections and report
+  design — some of the ReportViewer DLLs still have unpatched GIFs
+  (see workaround A) so dialogs in this area will likely throw.
+- Extended Events profiler UI.
+- SQL Server Profiler (separate tool in the bundle).
+- Database Engine Tuning Advisor.
+- Always On / HADR dialogs.
+- Publish to Azure wizard.
+- Activity Monitor.
+- Maintenance Plans designer.
+- Any Redgate / third-party extension integration, but this is the
+  reason this whole exercise was undertaken — deferred to a later
+  test cycle.
+- Multi-monitor behavior and DPI scaling above 100%.
+- Copy/paste of rich content (formatted SQL) across apps.
+- Undocking / redocking of tool windows to separate Wine windows.
+
+
+=======================================================
+RATING
+=======================================================
+
+Bronze.
+
+Everything core works (connection, Object Explorer browsing,
+queries, basic dialogs) but only after non-trivial binary patches
+to the shipped product. A user who follows the workarounds to the
+letter gets a usable day-to-day SSMS; an unpatched install is not
+usable. Platinum/Gold would require Wine itself to fix the GIF
+decoder (Bug 1 below), which would eliminate workaround A in one
+shot and probably obviate B as well. Silver would require at
+minimum that the GIF decoder be fixed without user-side patching.
+
+
+=======================================================
+OUTSTANDING WINE BUGS DISCOVERED
+=======================================================
+
+1. windowscodecs: GIF decoder unusable from GDI+
+   Repro: any .NET Framework program that calls
+   new Bitmap(File.OpenRead("*.gif")) with a valid GIF file.
+   Throws ArgumentException. Both builtin=b, native=n, and the
+   real Windows 11 native windowscodecs.dll all fail. Overriding
+   gdiplus to native or builtin makes no difference.
+
+2. odbc32: ANSI entry points are stubs that abort the calling
+   thread. SQLBrowseConnectA, SQLTablesA, SQLColumnPrivilegesA,
+   etc. are exported as __wine_stub_*. The W variants work.
+
+3. .NET Framework: Component.Site.GetService does not walk up to
+   VS Shell's global service container. Services registered with
+   IServiceContainer.AddService(type, factory, promote:true) by
+   one VS Package are not visible to a Component sited in another
+   Package's container via the ordinary Component.GetService call.
+   On Windows this works; under Wine it returns null.
+
+4. .NET Framework: <appDomainManagerAssembly>/<appDomainManagerType>
+   in the <runtime> section of an exe.config is silently ignored.
+   No fusion log entry, no type resolution, no InitializeNewDomain
+   call. Strong-named or not.
+
+5. .NET Framework: <Module>.cctor (module initializer) added to a
+   managed assembly via Cecil does not run on assembly load.
+   Normal class static ctors run correctly.
+
+
+=======================================================
+EXTRA COMMENTS
+=======================================================
+
+- Installation order matters: install dotnet48 BEFORE running
+  SSMS-Setup-ENU.exe. If SSMS installs on top of the Mono stub
+  that Wine creates, .NET redirects get weird.
+
+- The WineHQ apt repo's Jammy packages still "work" on Noble but
+  depend on libav* that aren't in Noble. The fix is to switch the
+  WineHQ source file from Suites: jammy to Suites: noble; there
+  IS a native Noble build at winehq.org. (We spent 15 min on this
+  until we noticed.)
+
+- The SSMS installer bundles VS 2017 Isolated Shell separately;
+  this is a large component and extends the install time
+  considerably but installs cleanly once .NET 4.8 is present.
+
+- SSMS writes a VS ActivityLog to
+  AppData/Roaming/Microsoft/AppEnv/15.0/ActivityLog.xml as UTF-16
+  LE — `iconv -f UTF-16LE -t UTF-8` it before grepping.
+
+- SSMS creates two SQL sessions on successful OE connect
+  (one metadata, one "Database Engine Query" — both Kerberos).
+  If sys.dm_exec_sessions shows reads=0 on both and nothing fires
+  when you click Refresh, OE is failing client-side in the tree
+  builder and you're facing Bug 3 in the Wine bugs list.
+
+- Wine's stderr is very noisy with "com_get_class_object class
+  {GUID} not registered" errors. Most are harmless VS Shell feature
+  probes. A couple that show up constantly:
+    {177f0c4a-1cd3-4de7-a32c-71dbbb9fa36d}  (some VS profiler svc)
+    {4e14fba2-2e22-11d1-9964-00c04fbbb345}  (VS Debugger svc)
+  Both are safe to ignore in this context.
+
+- Windows 10 compatibility mode (winetricks win10) is correct.
+  Under win7 or winxp modes, SSMS 20 fails to launch entirely.
